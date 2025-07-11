@@ -1,10 +1,12 @@
 import glob
+from pathlib import Path
 import logging
 from typing import List, Optional
 
 import folium
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from folium.plugins import HeatMap
 from scipy.interpolate import griddata
 from sklearn.neighbors import NearestNeighbors
@@ -16,6 +18,7 @@ GPS_SMOOTHING_RADIUS = 0.0001  # ~10 meters
 GRID_RESOLUTION = 100j
 HEATMAP_RADIUS = 15
 NO_SIGNAL_DEFAULT = -110
+SMOOTHING_THRESHOLD = 10
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -46,26 +49,28 @@ def load_signal_data(file_path: str) -> Optional[pd.DataFrame]:
 
 
 def smooth_gps_coordinates(df: pd.DataFrame, radius: float = GPS_SMOOTHING_RADIUS) -> pd.DataFrame:
-    """Apply radius-based smoothing to GPS coordinates."""
     coords = df[['Latitude', 'Longitude']].values
-    nbrs = NearestNeighbors(radius=radius).fit(coords)
-    
-    smoothed_rsrp = [
-        df.iloc[nbrs.radius_neighbors([coord], return_distance=False)[0]]['RSRP'].mean()
-        for coord in coords
-    ]
-    
-    df['RSRP'] = smoothed_rsrp
+    nbrs = NearestNeighbors(radius=radius, n_jobs=-1).fit(coords)
+    adjacency = nbrs.radius_neighbors_graph(coords, mode='connectivity')
+    rsrp_array = df['RSRP'].values
+
+    # Avoid division by zero by ensuring each point includes itself
+    sums = adjacency @ rsrp_array
+    counts = adjacency @ np.ones_like(rsrp_array)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        smoothed = np.divide(sums, counts, out=rsrp_array.copy(), where=counts != 0)
+
+    df = df.copy()
+    df['RSRP'] = smoothed
     return df
 
 
 def create_interpolation_grid(df: pd.DataFrame) -> tuple:
     """Create grid coordinates for signal interpolation."""
     lats, lons = df['Latitude'], df['Longitude']
-    return np.mgrid[
-        min(lons):max(lons):GRID_RESOLUTION,
-        min(lats):max(lats):GRID_RESOLUTION
-    ]
+    lon_min, lon_max = lons.min(), lons.max()
+    lat_min, lat_max = lats.min(), lats.max()
+    return np.mgrid[lon_min:lon_max:GRID_RESOLUTION, lat_min:lat_max:GRID_RESOLUTION]
 
 
 def generate_kml_output(grid_points: np.ndarray, signal_strengths: np.ndarray, output_path: str) -> None:
@@ -91,8 +96,8 @@ def generate_folium_map(df: pd.DataFrame, output_path: str) -> None:
     m = folium.Map(location=map_center, zoom_start=14)
     
     heat_data = [
-        [row['Latitude'], row['Longitude'], max(NO_SIGNAL_DEFAULT, row['RSRP'])] 
-        for _, row in df.iterrows()
+        [row.Latitude, row.Longitude, max(NO_SIGNAL_DEFAULT, row.RSRP)]
+        for row in df.itertuples(index=False)
     ]
     HeatMap(heat_data, radius=HEATMAP_RADIUS).add_to(m)
     
@@ -110,6 +115,7 @@ def generate_folium_map(df: pd.DataFrame, output_path: str) -> None:
 
 def generate_contour_plot(grid_x: np.ndarray, grid_y: np.ndarray, grid_z: np.ndarray, output_path: str) -> None:
     """Generate matplotlib contour plot."""
+    # Note: matplotlib imported within function to avoid slow imports when not generating plots.
     import matplotlib.pyplot as plt
     plt.figure(figsize=(10, 8))
     plt.contourf(grid_x, grid_y, grid_z, levels=20, cmap='RdYlGn_r')
@@ -132,7 +138,7 @@ def process_signal_data(df: pd.DataFrame) -> tuple:
 def load_multiple_files(file_pattern: str = "netmonster_*.csv") -> Optional[pd.DataFrame]:
     """Load and combine multiple signal data files."""
     try:
-        files = glob.glob(file_pattern)
+        files = list(Path().glob(file_pattern))
         if not files:
             raise FileNotFoundError(f"No files matching {file_pattern}")
         
@@ -165,7 +171,7 @@ def main() -> None:
         return
     
     try:
-        if len(signal_data) > 10:
+        if len(signal_data) > SMOOTHING_THRESHOLD:
             signal_data = smooth_gps_coordinates(signal_data)
     except Exception as e:
         logger.warning(f"GPS smoothing skipped: {str(e)}")
