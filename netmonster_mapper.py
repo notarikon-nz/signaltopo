@@ -4,10 +4,12 @@ import logging
 from typing import List, Optional, Tuple
 from functools import lru_cache
 import warnings
+import time
 
 import folium
 import numpy as np
 import pandas as pd
+from contextlib import contextmanager
 from scipy import sparse
 from folium.plugins import HeatMap
 from scipy.interpolate import griddata
@@ -25,8 +27,14 @@ CHUNK_SIZE = 10000  # Process data in chunks to manage memory
 MAX_INTERPOLATION_POINTS = 50000  # Limit interpolation points for performance
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(format="[%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+@contextmanager
+def timed_operation(description: str):
+    start = time.time()
+    yield
+    logger.info(f"{description} completed in {time.time()-start:.2f}s")
 
 
 def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -351,46 +359,49 @@ def main() -> None:
         'plot': "signal_plot.png"
     }
     
-    # Load data with optimized loading
-    signal_data = load_multiple_files()
-    if signal_data is None:
-        logger.error("Aborting - no valid data available")
-        return
-    
-    logger.info(f"Processing {len(signal_data)} data points")
-    
-    # Apply GPS smoothing only for datasets that benefit from it
-    try:
-        if len(signal_data) > SMOOTHING_THRESHOLD:
-            logger.info("Applying GPS coordinate smoothing...")
-            signal_data = smooth_gps_coordinates(signal_data)
-    except Exception as e:
-        logger.warning(f"GPS smoothing skipped: {str(e)}")
-    
-    # Generate outputs with optimized functions
-    try:
-        logger.info("Generating interpolation grid...")
-        grid_x, grid_y, grid_z = process_signal_data(signal_data)
+    with timed_operation("Total execution time"):
+
+        # Load data with optimized loading
+        signal_data = load_multiple_files()
+        if signal_data is None:
+            logger.error("Aborting - no valid data available")
+            return
         
-        if output_files['kml']:
-            logger.info("Generating KML output...")
-            generate_kml_output(
-                np.column_stack((grid_x.ravel(), grid_y.ravel())), 
-                grid_z.ravel(), 
-                output_files['kml']
-            )
+        logger.info(f"Processing {len(signal_data)} data points")
         
-        if output_files['html']:
-            logger.info("Generating HTML heatmap...")
-            generate_folium_map(signal_data, output_files['html'])
+        # Apply GPS smoothing only for datasets that benefit from it
+        try:
+            if len(signal_data) > SMOOTHING_THRESHOLD:
+                with timed_operation("Smoothing GPS coordinates"):
+                    signal_data = smooth_gps_coordinates(signal_data)
+
+        except Exception as e:
+            logger.warning(f"GPS smoothing skipped: {str(e)}")
         
-        if output_files['plot']:
-            logger.info("Generating contour plot...")
-            generate_contour_plot(grid_x, grid_y, grid_z, output_files['plot'])
-        
-        logger.info("Successfully generated all output files")
-    except Exception as e:
-        logger.error(f"Map generation failed: {str(e)}")
+        # Generate outputs with optimized functions
+        try:
+            with timed_operation("Interpolation Grid generation"):
+                grid_x, grid_y, grid_z = process_signal_data(signal_data)
+            
+            if output_files['kml']:
+                with timed_operation("KML generation"):
+                    generate_kml_output(
+                        np.column_stack((grid_x.ravel(), grid_y.ravel())), 
+                        grid_z.ravel(), 
+                        output_files['kml']
+                    )
+            
+            if output_files['html']:
+                with timed_operation("HTML heatmap generation"):
+                    generate_folium_map(signal_data, output_files['html'])
+            
+            if output_files['plot']:
+                with timed_operation("Contour plot generation"):
+                    generate_contour_plot(grid_x, grid_y, grid_z, output_files['plot'])
+            
+            logger.info("Successfully generated all output files")
+        except Exception as e:
+            logger.error(f"Map generation failed: {str(e)}")
 
 
 if __name__ == "__main__":
