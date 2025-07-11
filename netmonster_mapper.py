@@ -1,170 +1,195 @@
-import pandas as pd # type: ignore
-import numpy as np
-from scipy.interpolate import griddata # type: ignore
-import folium
-from sklearn.neighbors import NearestNeighbors 
 import glob
 import logging
 from typing import List, Optional
 
-def load_and_clean_csv(csv_path):
-    """Load NetMonster CSV and clean data."""
-    df = pd.read_csv(csv_path)
-    
-    # Keep essential columns (adjust names based on your CSV)
-    required_cols = ['Latitude', 'Longitude', 'RSRP']
-    df = df[required_cols].dropna()
-    
-    # Remove extreme outliers (e.g., RSRP < -120 dBm)
-    df = df[(df['RSRP'] >= -120) & (df['RSRP'] <= -50)]
-    
-    return df
+import folium
+import numpy as np
+import pandas as pd
+from folium.plugins import HeatMap
+from scipy.interpolate import griddata
+from sklearn.neighbors import NearestNeighbors
 
-def smooth_gps(df, radius=0.0001):  # ~10 meters
-    """Average nearby GPS points to reduce noise."""
-    coords = df[['Latitude', 'Longitude']].values
-    nbrs = NearestNeighbors(radius=radius).fit(coords)
-    smoothed = []
-    for i in range(len(coords)):
-        neighbors = nbrs.radius_neighbors([coords[i]], return_distance=False)
-        smoothed.append(df.iloc[neighbors[0]]['RSRP'].mean())
-    df['RSRP'] = smoothed
-    return df
-
-def create_heatmap(df, output_kml=None, output_html=None, output_plot=None):
-    """Generate a heatmap from RSRP data."""
-    lats, lons, rsrp = df['Latitude'], df['Longitude'], df['RSRP']
-    
-    # Interpolate signal strength onto a grid
-    grid_x, grid_y = np.mgrid[
-        min(lons):max(lons):100j,
-        min(lats):max(lats):100j
-    ]
-    grid_z = griddata(
-        (lons, lats), rsrp,
-        (grid_x, grid_y),
-        method='cubic', fill_value=-110  # Default for no signal
-    )
-    
-    # --- OPTION 1: Export to KML (Google Earth) ---
-    if output_kml:
-        import simplekml
-        kml = simplekml.Kml()
-        for x, y, z in zip(grid_x.ravel(), grid_y.ravel(), grid_z.ravel()):
-            pnt = kml.newpoint(coords=[(x, y)])
-            pnt.style.iconstyle.color = simplekml.Color.rgb(
-                int(255 * (1 - max(0, min(1, (z + 110) / 60)))),  # Red (weak) -> Green (strong)
-                int(255 * max(0, min(1, (z + 80) / 60))),
-                0
-            )
-        kml.save(output_kml)
-    
-    # --- OPTION 2: Interactive Folium Map ---
-    if output_html:
-        m = folium.Map(location=[df['Latitude'].mean(), df['Longitude'].mean()], zoom_start=14)
-        
-        # Add heatmap layer
-        from folium.plugins import HeatMap
-        heat_data = [[row['Latitude'], row['Longitude'], max(-110, row['RSRP'])] for _, row in df.iterrows()]
-        HeatMap(heat_data, radius=15).add_to(m)
-        
-        # Add markers for weakest/strongest points
-        for _, row in df.nlargest(5, 'RSRP').iterrows():  # Strongest
-            folium.Marker([row['Latitude'], row['Longitude']], 
-                         tooltip=f"Strong: {row['RSRP']} dBm",
-                         icon=folium.Icon(color='green')).add_to(m)
-        for _, row in df.nsmallest(5, 'RSRP').iterrows():  # Weakest
-            folium.Marker([row['Latitude'], row['Longitude']], 
-                         tooltip=f"Weak: {row['RSRP']} dBm",
-                         icon=folium.Icon(color='red')).add_to(m)
-        
-        m.save(output_html)
-
-    if output_plot:
-        import matplotlib.pyplot as plt
-        plt.contourf(grid_x, grid_y, grid_z, levels=20, cmap='RdYlGn_r')
-        plt.colorbar(label='RSRP (dBm)')
-        plt.scatter(lons, lats, c=rsrp, s=5, edgecolor='black')
-        plt.savefig('signal_plot.png')        
-
+# Constants
+REQUIRED_COLS = {'Latitude', 'Longitude', 'RSRP'}
+RSRP_RANGE = (-120, -50)
+GPS_SMOOTHING_RADIUS = 0.0001  # ~10 meters
+GRID_RESOLUTION = 100j
+HEATMAP_RADIUS = 15
+NO_SIGNAL_DEFAULT = -110
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def safe_load_csv(file_path: str) -> Optional[pd.DataFrame]:
-    """Attempt to load and clean a CSV with error handling."""
+
+def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure dataframe contains required columns and valid RSRP values."""
+    missing_cols = REQUIRED_COLS - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+    
+    filtered_df = df[list(REQUIRED_COLS)].dropna()
+    return filtered_df[
+        (filtered_df['RSRP'] >= RSRP_RANGE[0]) & 
+        (filtered_df['RSRP'] <= RSRP_RANGE[1])
+    ]
+
+
+def load_signal_data(file_path: str) -> Optional[pd.DataFrame]:
+    """Load and validate signal data from a CSV file."""
     try:
         df = pd.read_csv(file_path)
-        
-        # Validate required columns
-        required_cols = {'Latitude', 'Longitude', 'RSRP'}
-        if not required_cols.issubset(df.columns):
-            missing = required_cols - set(df.columns)
-            raise ValueError(f"Missing columns: {missing}")
-            
-        # Basic cleaning
-        df = df[list(required_cols)].dropna()
-        df = df[(df['RSRP'] >= -120) & (df['RSRP'] <= -50)]
-        
-        return df
-    
+        return validate_dataframe(df)
     except Exception as e:
         logger.error(f"Failed to process {file_path}: {str(e)}")
         return None
 
-def load_all_data(file_pattern: str = "netmonster_*.csv") -> Optional[pd.DataFrame]:
-    """Safely load and combine multiple CSVs."""
+
+def smooth_gps_coordinates(df: pd.DataFrame, radius: float = GPS_SMOOTHING_RADIUS) -> pd.DataFrame:
+    """Apply radius-based smoothing to GPS coordinates."""
+    coords = df[['Latitude', 'Longitude']].values
+    nbrs = NearestNeighbors(radius=radius).fit(coords)
+    
+    smoothed_rsrp = [
+        df.iloc[nbrs.radius_neighbors([coord], return_distance=False)[0]]['RSRP'].mean()
+        for coord in coords
+    ]
+    
+    df['RSRP'] = smoothed_rsrp
+    return df
+
+
+def create_interpolation_grid(df: pd.DataFrame) -> tuple:
+    """Create grid coordinates for signal interpolation."""
+    lats, lons = df['Latitude'], df['Longitude']
+    return np.mgrid[
+        min(lons):max(lons):GRID_RESOLUTION,
+        min(lats):max(lats):GRID_RESOLUTION
+    ]
+
+
+def generate_kml_output(grid_points: np.ndarray, signal_strengths: np.ndarray, output_path: str) -> None:
+    """Generate KML file for Google Earth visualization."""
+    import simplekml
+    kml = simplekml.Kml()
+    
+    for (x, y), z in zip(grid_points, signal_strengths):
+        point = kml.newpoint(coords=[(x, y)])
+        normalized_strength = max(0, min(1, (z + 110) / 60))
+        point.style.iconstyle.color = simplekml.Color.rgb(
+            int(255 * (1 - normalized_strength)),
+            int(255 * max(0, min(1, (z + 80) / 60))),
+            0
+        )
+    
+    kml.save(output_path)
+
+
+def generate_folium_map(df: pd.DataFrame, output_path: str) -> None:
+    """Generate interactive Folium heatmap."""
+    map_center = [df['Latitude'].mean(), df['Longitude'].mean()]
+    m = folium.Map(location=map_center, zoom_start=14)
+    
+    heat_data = [
+        [row['Latitude'], row['Longitude'], max(NO_SIGNAL_DEFAULT, row['RSRP'])] 
+        for _, row in df.iterrows()
+    ]
+    HeatMap(heat_data, radius=HEATMAP_RADIUS).add_to(m)
+    
+    for strength, color, count in [('Strong', 'green', 5), ('Weak', 'red', 5)]:
+        data_subset = df.nlargest(count, 'RSRP') if strength == 'Strong' else df.nsmallest(count, 'RSRP')
+        for _, row in data_subset.iterrows():
+            folium.Marker(
+                [row['Latitude'], row['Longitude']],
+                tooltip=f"{strength}: {row['RSRP']} dBm",
+                icon=folium.Icon(color=color)
+            ).add_to(m)
+    
+    m.save(output_path)
+
+
+def generate_contour_plot(grid_x: np.ndarray, grid_y: np.ndarray, grid_z: np.ndarray, output_path: str) -> None:
+    """Generate matplotlib contour plot."""
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 8))
+    plt.contourf(grid_x, grid_y, grid_z, levels=20, cmap='RdYlGn_r')
+    plt.colorbar(label='RSRP (dBm)')
+    plt.savefig(output_path)
+    plt.close()
+
+
+def process_signal_data(df: pd.DataFrame) -> tuple:
+    """Process signal data and create interpolation grid."""
+    grid_x, grid_y = create_interpolation_grid(df)
+    grid_z = griddata(
+        (df['Longitude'], df['Latitude']), df['RSRP'],
+        (grid_x, grid_y),
+        method='cubic', fill_value=NO_SIGNAL_DEFAULT
+    )
+    return grid_x, grid_y, grid_z
+
+
+def load_multiple_files(file_pattern: str = "netmonster_*.csv") -> Optional[pd.DataFrame]:
+    """Load and combine multiple signal data files."""
     try:
         files = glob.glob(file_pattern)
         if not files:
             raise FileNotFoundError(f"No files matching {file_pattern}")
         
         logger.info(f"Found {len(files)} files to process")
+        data_frames = [df for f in files if (df := load_signal_data(f)) is not None]
         
-        # Load with error handling
-        all_dfs = []
-        for f in files:
-            df = safe_load_csv(f)
-            if df is not None:
-                all_dfs.append(df)
-        
-        if not all_dfs:
+        if not data_frames:
             raise ValueError("No valid data found in any files")
             
-        combined_df = pd.concat(all_dfs).drop_duplicates()
+        combined_df = pd.concat(data_frames).drop_duplicates()
         logger.info(f"Combined data shape: {combined_df.shape}")
-        
         return combined_df
     
     except Exception as e:
-        logger.critical(f"Fatal error during data loading: {str(e)}")
+        logger.critical(f"Data loading failed: {str(e)}")
         return None
 
-def main():
-    OUTPUT_KML = "signal_map.kml"
-    OUTPUT_HTML = "signal_map.html"
-    OUTPUT_PLOT = "signal_plot.png"
+
+def main() -> None:
+    """Main execution function."""
+    output_files = {
+        'kml': "signal_map.kml",
+        'html': "signal_map.html",
+        'plot': "signal_plot.png"
+    }
     
-    # Load data with error checking
-    combined_df = load_all_data()
-    if combined_df is None:
-        logger.error("Aborting - no data available")
+    signal_data = load_multiple_files()
+    if signal_data is None:
+        logger.error("Aborting - no valid data available")
         return
     
-    # Optional smoothing (with check)
     try:
-        if len(combined_df) > 10:  # Only smooth if sufficient data
-            combined_df = smooth_gps(combined_df)
+        if len(signal_data) > 10:
+            signal_data = smooth_gps_coordinates(signal_data)
     except Exception as e:
-        logger.warning(f"GPS smoothing failed: {str(e)}")
+        logger.warning(f"GPS smoothing skipped: {str(e)}")
     
-    # Generate outputs
     try:
-        create_heatmap(combined_df, OUTPUT_KML, OUTPUT_HTML, OUTPUT_PLOT)
-        logger.info(f"Successfully generated map outputs")
+        grid_x, grid_y, grid_z = process_signal_data(signal_data)
+        
+        if output_files['kml']:
+            generate_kml_output(
+                np.column_stack((grid_x.ravel(), grid_y.ravel())), 
+                grid_z.ravel(), 
+                output_files['kml']
+            )
+        
+        if output_files['html']:
+            generate_folium_map(signal_data, output_files['html'])
+        
+        if output_files['plot']:
+            generate_contour_plot(grid_x, grid_y, grid_z, output_files['plot'])
+        
+        logger.info("Successfully generated all output files")
     except Exception as e:
-        logger.error(f"Failed to generate maps: {str(e)}")
+        logger.error(f"Map generation failed: {str(e)}")
+
 
 if __name__ == "__main__":
     main()
